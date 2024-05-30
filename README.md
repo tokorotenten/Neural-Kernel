@@ -1,7 +1,7 @@
 # About
 This repository contains codes to reproduce experimental results of the paper:
 
-E.Shimizu, K.Fukumizu, D.Sejdinovic, **Neural-Kernel Conditioal Mean Embeddings**. In *Proceedings of International Conference on Machine Learning* (ICML), 2024.
+E.Shimizu, K.Fukumizu, D.Sejdinovic, **Neural-Kernel Conditional Mean Embeddings**. In *Proceedings of International Conference on Machine Learning* (ICML), 2024.
 
 Install the latest versions of:
 mlflow, hydra, tqdm, jax, optax, equinox, gymnax, normflows, lightning-uq-box
