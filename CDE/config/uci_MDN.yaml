@@ -1,0 +1,23 @@
+# config.yaml
+data:
+  num_seeds: 20
+  name: "uci"
+  data_path: "bostonHousing/data"
+
+model:
+  mix: 10
+  type: "small"
+
+optimizer:
+  lr: 5e-4
+  weight_decay: true
+
+train:
+  epoch: 500
+  batch_size: 32
+
+test:
+  num_sample: 1000
+
+mlflow: 
+  runname: "sample"

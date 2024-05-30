@@ -1,0 +1,25 @@
+# config.yaml
+device: "cpu"
+data:
+  num_seeds: 20
+  name: "uci"
+  data_path: "bostonHousing/data"
+
+model:
+  hidden_units: 50
+  hidden_layers: 2
+  num_flows: 5
+
+optimizer:
+  lr: 1e-3
+  weight_decay: true
+
+train:
+  epoch: 10
+  batch_size: 50
+
+test:
+  num_sample: 1000
+
+mlflow: 
+  runname: "sample"

@@ -1,0 +1,23 @@
+# config.yaml
+data:
+  num_seeds: 10
+  name: "bimodal"
+  N_x: 5000
+  N_y: 50
+
+model:
+  mix: 10
+
+optimizer:
+  lr: 1e-4
+  weight_decay: true
+
+train:
+  epoch: 1000
+  batch_size: 50
+
+test:
+  num_sample: 50
+
+mlflow: 
+  runname: "sample"

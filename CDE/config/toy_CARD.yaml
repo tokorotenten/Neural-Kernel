@@ -1,0 +1,26 @@
+# config.yaml
+device: "cpu"
+
+data:
+  num_seeds: 10
+  name: "bimodal"
+  N_x: 5000
+  N_y: 50
+
+model:
+  DF_steps: 1000
+
+optimizer:
+  MLP_lr: 1e-3
+  DF_lr: 1e-3
+
+train:
+  epoch_MLP: 100
+  epoch_DF: 5000
+  batch_size: 256
+
+test:
+  num_sample: 50
+
+mlflow: 
+  runname: "sample"
