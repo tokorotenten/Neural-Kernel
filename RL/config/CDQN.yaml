@@ -1,0 +1,29 @@
+# config.yaml
+env_name: "CartPole-v1"
+env_kwargs: {}
+env_params: {}
+num_env: 10
+buffer_size: 10000
+
+model:
+  numAtom: 51
+  v_max: 100
+  v_min: -100
+
+optimizer:
+  lr: 1.0e-3
+  eps: 1.0e-4
+
+train:
+  steps: 500000
+  batch_size: 32
+  gamma: 0.99
+  policy_update_period: 2
+  target_update_period: 100
+
+test:
+  evaluate_period: 100
+  test_epsilon: 0.001
+
+mlflow: 
+  runname: "sample"

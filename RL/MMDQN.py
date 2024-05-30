@@ -1,0 +1,220 @@
+import os
+import sys
+from omegaconf import DictConfig, ListConfig
+
+from functools import partial
+import numpy as np
+import jax
+import jax.numpy as jnp
+import jax.lax as lax
+from jax.scipy.special import logsumexp
+import optax  
+import equinox as eqx
+from typing import Any, Callable, Tuple
+from collections import defaultdict
+import tqdm
+import gymnax
+
+from utils import BatchManager, RolloutManager
+from model.MMDQN_models import NN as NN
+
+import hydra
+from hydra import utils
+import mlflow
+from tqdm import tqdm
+
+def log_params_from_omegaconf_dict(params):
+    for param_name, element in params.items():
+        _explore_recursive(param_name, element)
+
+def _explore_recursive(parent_name, element):
+    if isinstance(element, DictConfig):
+        for k, v in element.items():
+            if isinstance(v, DictConfig) or isinstance(v, ListConfig):
+                _explore_recursive(f'{parent_name}.{k}', v)
+            else:
+                mlflow.log_param(f'{parent_name}.{k}', v)
+    elif isinstance(element, ListConfig):
+        for i, v in enumerate(element):
+            mlflow.log_param(f'{parent_name}.{i}', v)
+
+
+def Gram(X, Y, sig):
+  def pairwisedist(X,Y):
+    def dist(x,y):
+      z=x-y
+      return jnp.sum(jnp.square(z))
+    vmapped_dist = jax.vmap(dist, in_axes=(0, None))
+    return jax.vmap(vmapped_dist, in_axes=(None, 0))(X,Y)
+  S = pairwisedist(X, Y).T
+  mix_G = jnp.exp(-(jnp.expand_dims(S,0))/(2*jnp.expand_dims(sig,-1)**2))
+  return mix_G.mean(0)
+
+
+def policy(model, model_state, obs, action_size, eps, key):
+    def random(subkey):
+        return jax.random.choice(subkey, jnp.arange(action_size))
+    def greedy(subkey):
+        pmfs, state, sig = model(obs, model_state)
+        q_vals = pmfs.mean(axis=-1)
+        action = jnp.argmax(q_vals, axis=-1)
+        return action
+    explore = jax.random.uniform(key)<eps
+    key, subkey = jax.random.split(key)
+    action = lax.cond(explore, random, greedy, operand = subkey)
+    return action
+
+
+def bellman_loss(p_model, p_model_state, t_model, t_model_state, obs, actions, next_obs, rewards, dones, gamma):
+    t_batch_model = jax.vmap(t_model, in_axes=(0, None), out_axes=(0, None, None))
+    p_model = eqx.nn.inference_mode(p_model, False)
+    p_batch_model = jax.vmap(p_model, in_axes=(0, None), out_axes=(0, None, None))
+
+    next_pmfs, t_model_state, t_sig = t_batch_model(next_obs, t_model_state)  # (batch_size, num_actions, num_atoms)
+    next_pmfs = lax.stop_gradient(next_pmfs)
+    next_vals = next_pmfs.mean(axis=-1)  # (batch_size, num_actions)
+    next_action = jnp.argmax(next_vals, axis=-1)  # (batch_size,)
+    next_pmfs = next_pmfs[jnp.arange(next_pmfs.shape[0]), next_action]
+    
+    #scale reward if necessary
+    rewards = (rewards)*0.1 
+
+    next_pmfs = rewards.reshape((-1,1)) + gamma * next_pmfs * (1 - dones.reshape((-1,1)))
+
+    pmfs, p_model_state, p_sig = p_batch_model(obs, p_model_state)
+    pmfs = pmfs[jnp.arange(pmfs.shape[0]), actions.astype(int)]
+
+    def RKHSloss(next_pmfs, pmfs, p_sig):
+        v_Gram = jax.vmap(Gram, in_axes=(0, 0, None))
+        N = next_pmfs.shape[1]
+        term1 = (v_Gram(pmfs, next_pmfs, p_sig)).sum((1,2))*(1/N**2)
+        term2 = (v_Gram(pmfs, pmfs, p_sig)).sum((1,2))*(1/N**2)
+        term0 = (v_Gram(next_pmfs, next_pmfs, p_sig)).sum((1,2))*(1/N**2)
+        loss = term0 -2*term1 + term2
+        loss = loss.sum()
+        return loss/next_pmfs.shape[0]
+    
+    loss = RKHSloss(jnp.expand_dims(next_pmfs,-1), jnp.expand_dims(pmfs,-1), p_sig)
+
+    return loss, p_model_state
+
+
+@eqx.filter_jit
+def make_step_vec(p_model, p_model_state, t_model, t_model_state, optim, opt_state, obs, actions, next_obs, rewards, dones, gamma):
+    grads, p_model_state = eqx.filter_vmap(eqx.filter_grad(bellman_loss, has_aux=True))(p_model, p_model_state, t_model, t_model_state, obs, actions, next_obs, rewards, dones, gamma)
+    updates, opt_state = optim.update(grads, opt_state, p_model)
+    p_model = eqx.apply_updates(p_model, updates)
+    return p_model, p_model_state, opt_state
+
+@partial(jax.jit, static_argnums=(0,1,2,4))
+def exponential_schedule(start_e: float, end_e: float, duration: int, t: int, num_env):
+    eps = end_e + (start_e - end_e) * jnp.exp(-1 * t / duration)
+    eps_v = jnp.broadcast_to(eps, (num_env, ))
+    return eps_v
+
+@partial(jax.jit, static_argnums=(0,1,2,4))
+def linear_schedule(start_e: float, end_e: float, duration: int, t: int, num_env):
+    slope = (end_e - start_e) / duration
+    eps = slope * t + start_e
+    eps = jnp.clip(jnp.array(eps), a_min=jnp.array(end_e))
+    eps_v = jnp.broadcast_to(eps, (num_env, ))
+    return eps_v
+
+
+@hydra.main(config_name='MMDQN', version_base=None, config_path="config")
+def main(cfg):
+    #managers, env
+    rollout_manager = RolloutManager(cfg.env_name, cfg.env_kwargs, cfg.env_params, policy)
+    batch_manager = BatchManager(cfg.buffer_size, cfg.num_env, rollout_manager.action_size, rollout_manager.observation_space)
+    
+    #models initialize
+    seed = 5678
+    key = jax.random.PRNGKey(seed)
+    key, mkey = jax.random.split(key, 2)
+    mkeys = jax.random.split(mkey, cfg.num_env)
+
+    sigs = jnp.array([np.linspace(1, 10, cfg.model.mix)]).T
+    v_sig = jnp.broadcast_to(sigs, (cfg.num_env, sigs.shape[0], 1))
+
+    p_model, p_model_state = eqx.filter_vmap(eqx.nn.make_with_state(NN))(rollout_manager.observation_space, cfg.model.numAtom*rollout_manager.action_size, cfg.model.numAtom, v_sig,  mkeys)
+    t_model = p_model
+    t_model_state = p_model_state
+    t_model = eqx.nn.inference_mode(t_model)
+
+    #optimizer
+    optim = optax.adam(learning_rate = cfg.optimizer.lr, eps = cfg.optimizer.eps)
+    opt_state = optim.init(eqx.filter(p_model, eqx.is_inexact_array))
+
+    epsilon_init = jnp.broadcast_to(jnp.array(1.0), (cfg.num_env, ))
+    epsilon_test = jnp.broadcast_to(jnp.array(cfg.test.test_epsilon), (cfg.num_env, ))
+
+
+    @eqx.filter_jit
+    def get_transition(model, model_state, obs, state, batch, eps, num_train_envs, key):
+        #inference mode
+        inference_model = eqx.nn.inference_mode(model)
+
+        key, key_act = jax.random.split(key)
+        key_acts = jax.random.split(key_act, num_train_envs)
+        action = rollout_manager.select_action(inference_model, model_state, obs, eps, key_acts)
+        key, key_step = jax.random.split(key)
+        key_steps = jax.random.split(key_step, num_train_envs)
+        # Automatic env resetting in gymnax step!
+        next_obs, next_state, reward, done, _ = rollout_manager.batch_step(key_steps, state, action)
+        batch = batch_manager.append(batch, obs, action, reward, next_obs, done)
+        return next_obs, next_state, done, batch
+    
+    #initialize managers
+    batch = batch_manager.reset()
+    key, key_step, key_reset, key_eval, key_update, key_buffer = jax.random.split(key, 6)
+    obs, state = rollout_manager.batch_reset(jax.random.split(key_reset, cfg.num_env))
+    #initialize buffer
+    for i in range(cfg.buffer_size):
+        key_buffer, sub_key_buffer =  jax.random.split(key_buffer, 2)
+        obs, state, done, batch = get_transition(p_model, p_model_state, obs, state, batch, epsilon_init, cfg.num_env, sub_key_buffer)
+
+    #episodes
+    eval_count = 0
+    mlflow.set_experiment(cfg.mlflow.runname)
+    with mlflow.start_run():
+        log_params_from_omegaconf_dict(cfg)
+        for steps in tqdm(range(cfg.train.steps)):
+            #transition, eps update
+            eps = linear_schedule(1.0, 0.01, 10000, steps, cfg.num_env)
+            key_step, sub_key_step =  jax.random.split(key_step, 2)
+            obs, state, done, batch = get_transition(p_model, p_model_state, obs, state, batch, eps, cfg.num_env, sub_key_step)
+            
+            #update
+            if steps % cfg.train.policy_update_period == 0:
+                key_update, sub_key_update =  jax.random.split(key_update, 2)
+                sub_key_updates =  jax.random.split(sub_key_update, cfg.num_env)
+                rb_obs, rb_actions, rb_rewards, rb_next_obs, rb_dones = batch_manager.get(batch, cfg.train.batch_size, sub_key_updates)
+                p_model, p_model_state, opt_state = make_step_vec(p_model, p_model_state, t_model, t_model_state, optim, opt_state, rb_obs, rb_actions, rb_next_obs, rb_rewards, rb_dones, cfg.train.gamma)
+    
+
+            #target update
+            if steps % cfg.train.target_update_period == 0:
+                del t_model
+                del t_model_state
+                t_model = p_model
+                t_model_state = p_model_state
+                t_model = eqx.nn.inference_mode(t_model)
+                
+             #evaluate
+            if steps % cfg.test.evaluate_period == 0:
+                key_eval, sub_key_eval =  jax.random.split(key_eval, 2)
+                rewards = rollout_manager.batch_evaluate(p_model, p_model_state, cfg.num_env, epsilon_test, sub_key_eval)
+                rewards_mean = jnp.mean(rewards)
+                rewards_std = jnp.std(rewards)
+                mlflow.log_metric("reward_mean", rewards_mean, step = eval_count)
+                mlflow.log_metric("reward_std", rewards_std, step = eval_count)
+                eval_count += 1
+
+        return p_model, p_model_state
+
+
+if __name__ == '__main__':
+   main()
+
+
+
